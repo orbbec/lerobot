@@ -127,7 +127,12 @@ def prepare_observation_for_inference(
     for name in observation:
         observation[name] = torch.from_numpy(observation[name])
         if "image" in name:
-            observation[name] = observation[name].type(torch.float32) / 255
+            if name.endswith("_depth"):
+                # Depth: uint16 mm → float32 meters, (H,W,1) → (1,H,W)
+                observation[name] = observation[name].to(torch.float32) / 1000.0
+            else:
+                # RGB: uint8 → float32 [0,1], (H,W,C) → (C,H,W)
+                observation[name] = observation[name].to(torch.float32) / 255
             observation[name] = observation[name].permute(2, 0, 1).contiguous()
         observation[name] = observation[name].unsqueeze(0)
         observation[name] = observation[name].to(device)

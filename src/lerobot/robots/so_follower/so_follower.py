@@ -19,6 +19,8 @@ import time
 from functools import cached_property
 from typing import TypeAlias
 
+import numpy as np
+
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
@@ -62,6 +64,7 @@ class SOFollower(Robot):
             calibration=self.calibration,
         )
         self.cameras = make_cameras_from_configs(config.cameras)
+        self._prev_action: dict[str, float] | None = None
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -69,9 +72,13 @@ class SOFollower(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
-        }
+        features = {}
+        for cam_name in self.cameras:
+            cam_cfg = self.config.cameras[cam_name]
+            features[cam_name] = (cam_cfg.height, cam_cfg.width, 3)
+            if getattr(cam_cfg, "use_depth", False):
+                features[f"{cam_name}_depth"] = (cam_cfg.height, cam_cfg.width, 1)
+        return features
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -162,7 +169,7 @@ class SOFollower(Robot):
                 self.bus.write("P_Coefficient", motor, 16)
                 # Set I_Coefficient and D_Coefficient to default value 0 and 32
                 self.bus.write("I_Coefficient", motor, 0)
-                self.bus.write("D_Coefficient", motor, 32)
+                self.bus.write("D_Coefficient", motor, 0)
 
                 if motor == "gripper":
                     self.bus.write("Max_Torque_Limit", motor, 500)  # 50% of max torque to avoid burnout
@@ -176,7 +183,7 @@ class SOFollower(Robot):
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
 
     @check_if_not_connected
-    def get_observation(self) -> RobotObservation:
+    def get_observation(self, skip_cameras: bool = False, skip_depth: bool = False) -> RobotObservation:
         # Read arm position
         start = time.perf_counter()
         obs_dict = self.bus.sync_read("Present_Position")
@@ -184,12 +191,29 @@ class SOFollower(Robot):
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
+        if skip_cameras:
+            return obs_dict
+
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
             obs_dict[cam_key] = cam.read_latest()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+
+            # Read depth frame if camera has depth enabled and not skipped
+            if not skip_depth and getattr(self.config.cameras[cam_key], "use_depth", False):
+                try:
+                    start = time.perf_counter()
+                    depth_frame = cam.async_read_depth()
+                    if depth_frame is not None:
+                        if depth_frame.ndim == 2:
+                            depth_frame = np.expand_dims(depth_frame, axis=-1)
+                        obs_dict[f"{cam_key}_depth"] = depth_frame
+                    dt_ms = (time.perf_counter() - start) * 1e3
+                    logger.debug(f"{self} read {cam_key} depth: {dt_ms:.1f}ms")
+                except Exception as e:
+                    logger.debug(f"Failed to read depth from '{cam_key}': {e}")
 
         return obs_dict
 
@@ -209,6 +233,15 @@ class SOFollower(Robot):
         """
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
+
+        # Apply first-order low-pass filter for smooth motion
+        alpha = self.config.action_filter_alpha
+        if alpha < 1.0 and self._prev_action is not None:
+            goal_pos = {
+                k: alpha * goal_pos[k] + (1.0 - alpha) * self._prev_action.get(k, goal_pos[k])
+                for k in goal_pos
+            }
+        self._prev_action = dict(goal_pos)
 
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.

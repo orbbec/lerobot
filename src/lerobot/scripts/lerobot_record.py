@@ -78,6 +78,7 @@ from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.orbbec.configuration_orbbec import OrbbecCameraConfig  # noqa: F401
 from lerobot.cameras.reachy2_camera.configuration_reachy2_camera import Reachy2CameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
@@ -596,8 +597,20 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if not is_headless() and listener:
             listener.stop()
 
-        if cfg.dataset.push_to_hub:
-            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+        if cfg.dataset.push_to_hub and dataset is not None:
+            # Only push if dataset has episodes saved
+            if dataset.num_episodes > 0:
+                try:
+                    logging.info(f"📤 Pushing dataset to hub: {cfg.dataset.repo_id} ...")
+                    dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+                    logging.info(f"✅ Dataset pushed to hub: {cfg.dataset.repo_id}")
+                except Exception as e:
+                    logging.warning(f"⚠️  Failed to push dataset to hub: {e}")
+            else:
+                logging.info(
+                    "ℹ️  Skipping push to hub: No episodes saved "
+                    "(recording was interrupted before saving any episodes)"
+                )
 
         log_say("Exiting", cfg.play_sounds)
     return dataset

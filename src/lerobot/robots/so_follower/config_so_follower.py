@@ -39,6 +39,11 @@ class SOFollowerConfig:
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
+    # First-order low-pass filter coefficient for action smoothing.
+    # filtered = alpha * new_action + (1 - alpha) * prev_action
+    # alpha=1.0 means no filtering, smaller values mean more smoothing.
+    action_filter_alpha: float = 0.3
+
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = True
 

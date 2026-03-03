@@ -723,6 +723,13 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
             # Backward compatibility for "channel" which is an error introduced in LeRobotDataset v2.0 for ported datasets.
             if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
                 shape = (shape[2], shape[0], shape[1])
+        elif ft["dtype"] == "depth":
+            type = FeatureType.DEPTH
+            if len(shape) != 3:
+                raise ValueError(f"Number of dimensions of {key} != 3 (shape={shape})")
+            names = ft["names"]
+            if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
+                shape = (shape[2], shape[0], shape[1])
         elif key == OBS_ENV_STATE:
             type = FeatureType.ENV
         elif key.startswith(OBS_STR):

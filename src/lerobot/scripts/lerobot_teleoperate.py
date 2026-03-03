@@ -59,6 +59,7 @@ from pprint import pformat
 import rerun as rr
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.orbbec.configuration_orbbec import OrbbecCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.processor import (
@@ -218,8 +219,11 @@ def teleoperate(cfg: TeleoperateConfig):
     robot = make_robot_from_config(cfg.robot)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
-    teleop.connect()
     robot.connect()
+    try:
+        teleop.connect(robot=robot)
+    except TypeError:
+        teleop.connect()
 
     try:
         teleop_loop(

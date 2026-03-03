@@ -319,13 +319,49 @@ class ACT(nn.Module):
                 create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
             )
 
+        # RGBD depth mapping: image feature key -> depth feature key
+        self._depth_map = {}
+        self._img_keys = []
+
         # Backbone for image feature extraction.
         if self.config.image_features:
+            self._img_keys = list(self.config.image_features.keys())
+            # Build depth-to-image mapping for RGBD support
+            if config.depth_features:
+                for img_key in self._img_keys:
+                    depth_key = img_key + "_depth"
+                    if depth_key in config.depth_features:
+                        self._depth_map[img_key] = depth_key
+
             backbone_model = getattr(torchvision.models, config.vision_backbone)(
                 replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
                 weights=config.pretrained_backbone_weights,
                 norm_layer=FrozenBatchNorm2d,
             )
+
+            # Modify conv1 for 4-channel (RGBD) input if depth features are matched
+            if self._depth_map:
+                old_conv1 = backbone_model.conv1
+                new_conv1 = nn.Conv2d(
+                    4,
+                    old_conv1.out_channels,
+                    kernel_size=old_conv1.kernel_size,
+                    stride=old_conv1.stride,
+                    padding=old_conv1.padding,
+                    dilation=old_conv1.dilation,
+                    bias=(old_conv1.bias is not None),
+                )
+                with torch.no_grad():
+                    new_conv1.weight[:, :3] = old_conv1.weight
+                    new_conv1.weight[:, 3:4] = old_conv1.weight.mean(dim=1, keepdim=True)
+                    if old_conv1.bias is not None:
+                        new_conv1.bias.copy_(old_conv1.bias)
+                backbone_model.conv1 = new_conv1
+                print("[ACT] RGBD mode enabled: conv1 modified to 4-channel input")
+                print(f"[ACT] depth_map: {self._depth_map}")
+            else:
+                print("[ACT] RGB-only mode: conv1 remains 3-channel input")
+
             # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
@@ -469,7 +505,32 @@ class ACT(nn.Module):
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
+            for i, img in enumerate(batch[OBS_IMAGES]):
+                # Merge depth channel if RGBD is enabled for this camera
+                if self._depth_map:
+                    img_key = self._img_keys[i]
+                    if img_key in self._depth_map:
+                        depth = batch[self._depth_map[img_key]]
+                        depth = (depth / self.config.depth_max_range).clamp(0, 1)
+                        rgb_shape = list(img.shape)
+                        img = torch.cat([img, depth], dim=1)  # (B, 4, H, W)
+                        print(f"[ACT] camera '{img_key}': RGB{rgb_shape} + depth -> 4ch {list(img.shape)}")
+                    else:
+                        # Zero-pad cameras without depth to match 4-channel backbone
+                        pad = torch.zeros(
+                            img.shape[0],
+                            1,
+                            img.shape[2],
+                            img.shape[3],
+                            dtype=img.dtype,
+                            device=img.device,
+                        )
+                        rgb_shape = list(img.shape)
+                        img = torch.cat([img, pad], dim=1)  # (B, 4, H, W)
+                        print(
+                            f"[ACT] camera '{img_key}': RGB{rgb_shape} zero-padded to 4ch {list(img.shape)}"
+                        )
+
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
