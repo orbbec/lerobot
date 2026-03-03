@@ -2,7 +2,7 @@
 
 Everyone is welcome to contribute, and we value everybody's contribution. Code is not the only way to help the community. Answering questions, helping others, reaching out, and improving the documentation are immensely valuable.
 
-Whichever way you choose to contribute, please be mindful to respect our [code of conduct](./CODE_OF_CONDUCT.md).
+Whichever way you choose to contribute, please be mindful to respect our [code of conduct](./CODE_OF_CONDUCT.zh-CN.md) and our [AI policy](./AI_POLICY.zh-CN.md).
 
 ## Ways to Contribute
 
@@ -32,7 +32,7 @@ git remote add upstream https://github.com/huggingface/lerobot.git
 
 ### 2. Environment Installation
 
-Please follow our [Installation Guide](./docs/source/installation.mdx) for the environment setup & installation from source.
+Please follow our [Installation Guide](./installation.mdx) for the environment setup & installation from source.
 
 ## Running Tests & Quality Checks
 

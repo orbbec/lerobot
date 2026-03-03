@@ -131,4 +131,16 @@
     title: Contribute to LeRobot
   - local: backwardcomp
     title: Backward compatibility
+  - local: CODE_OF_CONDUCT
+    title: Code of Conduct
+  - local: CODE_OF_CONDUCT.zh-CN
+    title: Code of Conduct (中文)
+  - local: AI_POLICY
+    title: AI Policy
+  - local: AI_POLICY.zh-CN
+    title: AI Policy (中文)
+  - local: PERFORMANCE_NOTES
+    title: Performance Notes
+  - local: PERFORMANCE_NOTES.zh-CN
+    title: Performance Notes (中文)
   title: "About"
