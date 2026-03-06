@@ -29,8 +29,11 @@ lerobot-record \
     --dataset.streaming_encoding=true \
     --dataset.encoder_threads=2 \
     --display_data=true
-    # <- Optional: specify video codec (auto, h264, hevc, libsvtav1). Default is libsvtav1. \
-    # --dataset.vcodec=h264 \
+    # <- Optional: specify video codec. Default is h264 (portable). \
+    # --dataset.vcodec=h264 \\          # libx264 software H264 (portable, good performance)
+    # --dataset.vcodec=h264_v4l2m2m \\  # Jetson hardware H264 (fastest, near-zero CPU)
+    # --dataset.vcodec=hevc \\          # HEVC software (better compression than H264)
+    # --dataset.vcodec=libsvtav1 \\     # AV1 software (smallest files, very CPU heavy)
     # <- Teleop optional if you want to teleoperate to record or in between episodes with a policy \
     # --teleop.type=so100_leader \
     # --teleop.port=/dev/tty.usbmodem58760431551 \
@@ -187,6 +190,10 @@ class DatasetRecordConfig:
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
     # Video codec for encoding videos.
+    # Options: 'h264' (libx264 software, portable), 'h264_v4l2m2m' (Jetson hardware, fastest),
+    #          'h264_omx' (Jetson OpenMAX hardware), 'hevc', 'libsvtav1'.
+    # For Jetson: use 'h264_v4l2m2m' for hardware encoding (near-zero CPU cost).
+    # For other systems: use 'h264' for software encoding (portable).
     vcodec: str = "h264"
     # Enable streaming video encoding: encode frames in real-time during capture instead
     # of writing PNG images first. Makes save_episode() near-instant. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding
@@ -336,20 +343,35 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
-    frame_idx = 0
+    last_status_print = 0  # Track when we last printed status
+
+    # Hz rate tracking
+    loop_times = []
+    last_hz_print = time.perf_counter()
+    hz_print_interval = 1.0  # Print Hz rate every 1 second
+    prev_loop_start = time.perf_counter()  # Track previous loop start time
+    frame_idx = 0  # For throttling visualization
 
     # Depth read throttling: set to 1 to read depth every frame.
+    # For training with depth, it's usually better to keep depth time-aligned to RGB/actions.
     depth_read_interval = 1  # Read depth every frame
     last_depth_obs = {}  # Store last depth observation for frames where we skip depth
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
+        # Measure time since last loop (for Hz calculation)
+        if prev_loop_start > 0:
+            loop_period = start_loop_t - prev_loop_start
+            loop_times.append(loop_period)
+        prev_loop_start = start_loop_t
+
         if events["exit_early"]:
             events["exit_early"] = False
             break
 
         # Get robot observation - skip depth reads on some frames for performance
+        # We still read color cameras every frame for the dataset
         read_depth_this_frame = frame_idx % depth_read_interval == 0
         obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
 
@@ -357,6 +379,7 @@ def record_loop(
         if not read_depth_this_frame and last_depth_obs:
             obs.update(last_depth_obs)
         elif read_depth_this_frame:
+            # Store depth data for next frames where we skip depth
             last_depth_obs = {k: v for k, v in obs.items() if k.endswith("_depth")}
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
@@ -426,6 +449,8 @@ def record_loop(
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
+        # Visualization runs in a background thread - this call is non-blocking.
+        # Frames are dropped if the worker is still busy (queue size = 1).
         if display_data:
             obs_for_rerun = {
                 k: v
@@ -439,15 +464,51 @@ def record_loop(
         dt_s = time.perf_counter() - start_loop_t
 
         sleep_time_s: float = 1 / fps - dt_s
-        if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
 
         precise_sleep(max(sleep_time_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
+
+        # Print Hz rate every second
+        current_time = time.perf_counter()
+        if current_time - last_hz_print >= hz_print_interval:
+            if loop_times:
+                # Calculate actual Hz from measured loop periods (time between loop starts)
+                avg_loop_period = sum(loop_times) / len(loop_times)
+                current_hz = 1.0 / avg_loop_period if avg_loop_period > 0 else 0.0
+                target_hz = fps
+                # Also show the number of loops in this interval
+                num_loops = len(loop_times)
+                ep_str = ""
+                ep_idx = events.get("_episode_idx")
+                ep_total = events.get("_episode_total")
+                if ep_idx is not None and ep_total is not None:
+                    ep_str = f"📹 Ep {ep_idx}/{ep_total} | t={timestamp:05.1f}s | "
+                logging.info(
+                    f"{ep_str}⚡ Control rate: {current_hz:.1f} Hz (target: {target_hz} Hz) | "
+                    f"{num_loops} loops in {hz_print_interval:.1f}s"
+                )
+                loop_times.clear()  # Reset for next interval
+            last_hz_print = current_time
+
+        # Increment frame index for visualization and depth throttling
         frame_idx += 1
+
+        # Print episode progress every 5 seconds
+        if dataset is not None and timestamp - last_status_print >= 5.0:
+            elapsed_min = int(timestamp // 60)
+            elapsed_sec = int(timestamp % 60)
+            remaining_sec = max(0, int(control_time_s - timestamp))
+            remaining_min = remaining_sec // 60
+            remaining_sec = remaining_sec % 60
+
+            logging.info(
+                f"📹 Episode {dataset.num_episodes} | "
+                f"Time: {elapsed_min:02d}:{elapsed_sec:02d} / "
+                f"{int(control_time_s // 60):02d}:{int(control_time_s % 60):02d} | "
+                f"Remaining: {remaining_min:02d}:{remaining_sec:02d}"
+            )
+            last_status_print = timestamp
 
 
 @parser.wrap()
@@ -487,22 +548,32 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     try:
         if cfg.resume:
-            dataset = LeRobotDataset(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                vcodec=cfg.dataset.vcodec,
-                streaming_encoding=cfg.dataset.streaming_encoding,
-                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
-            )
-
-            if hasattr(robot, "cameras") and len(robot.cameras) > 0:
-                dataset.start_image_writer(
-                    num_processes=cfg.dataset.num_image_writer_processes,
-                    num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+            try:
+                dataset = LeRobotDataset(
+                    cfg.dataset.repo_id,
+                    root=cfg.dataset.root,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    vcodec=cfg.dataset.vcodec,
+                    streaming_encoding=cfg.dataset.streaming_encoding,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
                 )
-            sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
+
+                if hasattr(robot, "cameras") and len(robot.cameras) > 0:
+                    dataset.start_image_writer(
+                        num_processes=cfg.dataset.num_image_writer_processes,
+                        num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+                    )
+                sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
+            except (FileNotFoundError, ValueError, RuntimeError, OSError) as e:
+                error_msg = str(e)
+                logging.error(
+                    f"Failed to resume dataset '{cfg.dataset.repo_id}': {error_msg}\n"
+                    "The dataset does not exist or is incomplete.\n"
+                    "Remove --resume=true to create a new dataset, or ensure the dataset exists on the Hub."
+                )
+                # Exit early with clear error message instead of continuing with None dataset
+                return None
         else:
             # Create empty dataset or load existing saved episodes
             sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
@@ -551,7 +622,25 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                # Defensive: ensure stale flags from a previous loop/reset phase don't affect
+                # the semantics of finishing an episode early.
+                # In particular, RIGHT B sets `exit_early` to finish an episode early and save it,
+                # but if `rerecord_episode` was accidentally triggered earlier (and persists),
+                # the episode will be discarded and restarted instead.
+                events["rerecord_episode"] = False
+                events["exit_early"] = False
+
+                log_say(
+                    f"Recording episode {dataset.num_episodes + 1} / {dataset.num_episodes + cfg.dataset.num_episodes - recorded_episodes}",
+                    cfg.play_sounds,
+                )
+                logging.info(
+                    f"🎬 Starting Episode {dataset.num_episodes + 1} "
+                    f"(Progress: {recorded_episodes + 1}/{cfg.dataset.num_episodes} episodes)"
+                )
+                # Used only for logging inside record_loop.
+                events["_episode_idx"] = recorded_episodes + 1
+                events["_episode_total"] = cfg.dataset.num_episodes
                 record_loop(
                     robot=robot,
                     events=events,
@@ -569,12 +658,29 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                 )
+                events.pop("_episode_idx", None)
+                events.pop("_episode_total", None)
+
+                if events["rerecord_episode"]:
+                    log_say("Re-record episode", cfg.play_sounds)
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    dataset.clear_episode_buffer()
+                    continue
+
+                # Save episode immediately before reset phase so an interrupt during reset
+                # doesn't lose the episode.
+                dataset.save_episode()
+                recorded_episodes += 1
+
+                logging.info(
+                    f"✅ Episode {dataset.num_episodes} saved! "
+                    f"({recorded_episodes}/{cfg.dataset.num_episodes} episodes done)"
+                )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
+                if not events["stop_recording"] and recorded_episodes < cfg.dataset.num_episodes:
                     log_say("Reset the environment", cfg.play_sounds)
 
                     # reset g1 robot
@@ -593,16 +699,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                     )
-
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    continue
-
-                dataset.save_episode()
-                recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 

@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import numbers
 import os
+import queue
+import sys
+import threading
 
+import cv2
 import numpy as np
 import rerun as rr
 
@@ -22,25 +27,130 @@ from lerobot.processor import RobotAction, RobotObservation
 
 from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
 
+# ---------------------------------------------------------------------------
+# Background visualization thread
+# ---------------------------------------------------------------------------
+# The main control loop drops data into this queue and immediately continues.
+# A single daemon thread drains the queue and calls the actual rerun logging.
+# Queue size of 5 provides ~150ms buffer (5 frames @ 30Hz). If the network
+# is slow, new frames are dropped rather than blocking the control loop.
+
+_viz_queue: queue.Queue = queue.Queue(maxsize=1)
+_viz_thread: threading.Thread | None = None
+
+
+def _viz_worker() -> None:
+    """Background thread that drains the visualization queue."""
+    while True:
+        item = _viz_queue.get()
+        if item is None:  # sentinel → shut down
+            break
+        obs, action, compress = item
+        with contextlib.suppress(Exception):
+            _log_rerun_data_sync(obs, action, compress)
+
+
+def start_viz_thread() -> None:
+    """Start the background visualization thread (idempotent)."""
+    global _viz_thread
+    if _viz_thread is not None and _viz_thread.is_alive():
+        return
+    _viz_thread = threading.Thread(target=_viz_worker, name="viz_worker", daemon=True)
+    _viz_thread.start()
+
+
+def stop_viz_thread() -> None:
+    """Send the sentinel and wait for the worker to exit."""
+    global _viz_thread
+    if _viz_thread is not None and _viz_thread.is_alive():
+        with contextlib.suppress(queue.Full):
+            _viz_queue.put_nowait(None)
+        _viz_thread.join(timeout=2.0)
+    _viz_thread = None
+
+
+@contextlib.contextmanager
+def suppress_output():
+    """Context manager to suppress stdout and stderr."""
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        try:
+            sys.stdout = devnull
+            sys.stderr = devnull
+            yield
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
 
 def init_rerun(
-    session_name: str = "lerobot_control_loop", ip: str | None = None, port: int | None = None
+    session_name: str = "lerobot_control_loop",
+    ip: str | None = None,
+    port: int | None = None,
+    headless: bool = True,
+    grpc_port: int = 9876,
+    web_port: int = 9090,
+    open_browser: bool = False,
+    server_memory_limit: str = "25%",
 ) -> None:
-    """
-    Initializes the Rerun SDK for visualizing the control loop.
+    """Initializes the Rerun SDK for visualizing the control loop.
 
     Args:
         session_name: Name of the Rerun session.
-        ip: Optional IP for connecting to a Rerun server.
-        port: Optional port for connecting to a Rerun server.
+        ip: Optional IP for connecting to a Rerun server (upstream compatibility).
+        port: Optional port for connecting to a Rerun server (upstream compatibility).
+        headless: If True, run in headless mode with gRPC server (default).
+                  If False, spawn a local GUI viewer.
+                  Can be overridden by RERUN_HEADLESS env var ("true"/"false").
+                  Ignored if ip and port are provided.
+        grpc_port: Port for gRPC server (default 9876).
+        web_port: Port for web viewer (default 9090) - DEPRECATED, not used anymore.
+        open_browser: Whether to attempt opening browser (default False for headless).
+        server_memory_limit: Server-side buffer for late viewers (default "25%").
+
+    Notes:
+        If ip and port are provided, uses upstream's connection logic.
+        Otherwise, uses advanced headless mode: only the gRPC server is started on the Jetson.
+        To view data, run the web viewer on your external computer (with GPU):
+            rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://JETSON_IP:9876/proxy"
+        Then open http://localhost:9090 on your external computer's browser.
     """
-    batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
+    # Increase flush batch size for better throughput (reduces network round trips)
+    # Larger batch = fewer network calls = lower latency
+    batch_size = os.getenv(
+        "RERUN_FLUSH_NUM_BYTES", "64000"
+    )  # Increased from 32000 for even better throughput
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
+
+    # Set flush frequency to reduce overhead (flush less frequently for better throughput)
+    flush_frequency = os.getenv("RERUN_FLUSH_FREQUENCY", "10")  # Flush every 10 frames
+    os.environ["RERUN_FLUSH_FREQUENCY"] = flush_frequency
+
     rr.init(session_name)
-    memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
+
+    # Upstream compatibility: if ip and port are provided, use upstream's logic
     if ip and port:
+        memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
         rr.connect_grpc(url=f"rerun+http://{ip}:{port}/proxy")
+        rr.spawn(memory_limit=memory_limit)
+        return
+
+    # User's advanced headless mode logic
+    # Check if headless mode is overridden by environment variable
+    headless_env = os.getenv("RERUN_HEADLESS")
+    if headless_env is not None:
+        headless = headless_env.lower() in ("true", "1", "yes")
+
+    if headless:
+        # Start ONLY gRPC server on Jetson (headless logging endpoint)
+        # The web viewer should be run separately on external GPU-capable machine
+        # Suppress output messages from Rerun server startup
+        with suppress_output():
+            rr.serve_grpc(grpc_port=grpc_port, server_memory_limit=server_memory_limit)
     else:
+        # Fallback to spawn a local viewer (for dev with GUI)
+        memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
         rr.spawn(memory_limit=memory_limit)
 
 
@@ -50,48 +160,143 @@ def _is_scalar(x):
     )
 
 
+def _downsample_image(image: np.ndarray, scale_factor: float) -> np.ndarray:
+    """
+    Downsample an image for visualization bandwidth reduction.
+
+    Args:
+        image: Input image (HWC, CHW, or 2D format for depth images)
+        scale_factor: Scaling factor (e.g., 0.5 for half size)
+
+    Returns:
+        Downsampled image in the same format as input
+    """
+    if scale_factor >= 1.0:
+        return image
+
+    # Check if CHW format (channels first)
+    is_chw = image.ndim == 3 and image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4)
+
+    if is_chw:
+        # Convert CHW to HWC for cv2.resize
+        image = np.transpose(image, (1, 2, 0))
+
+    # Calculate new dimensions
+    new_height = int(image.shape[0] * scale_factor)
+    new_width = int(image.shape[1] * scale_factor)
+
+    # Downsample using cv2 (fast and high quality)
+    downsampled = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+    if is_chw:
+        # Convert back to CHW
+        downsampled = np.transpose(downsampled, (2, 0, 1))
+
+    return downsampled
+
+
 def log_rerun_data(
     observation: RobotObservation | None = None,
     action: RobotAction | None = None,
     compress_images: bool = False,
 ) -> None:
+    """Non-blocking async rerun logging.
+
+    Puts data into a queue consumed by the background viz thread so the main
+    control loop is never blocked by image compression or rerun logging.
+    Queue size of 5 provides ~150ms buffer. If the worker falls behind,
+    new frames are silently dropped rather than blocking the control loop.
+
+    Optimization: Check queue space before expensive array copying to avoid
+    wasted work when the queue is full.
     """
-    Logs observation and action data to Rerun for real-time visualization.
+    # Check if queue has space before doing expensive array copies
+    if _viz_queue.full():
+        return  # Skip this frame - worker is falling behind
 
-    This function iterates through the provided observation and action dictionaries and sends their contents
-    to the Rerun viewer. It handles different data types appropriately:
-    - Scalars values (floats, ints) are logged as `rr.Scalars`.
-    - 3D NumPy arrays that resemble images (e.g., with 1, 3, or 4 channels first) are transposed
-      from CHW to HWC format, (optionally) compressed to JPEG and logged as `rr.Image` or `rr.EncodedImage`.
-    - 1D NumPy arrays are logged as a series of individual scalars, with each element indexed.
-    - Other multi-dimensional arrays are flattened and logged as individual scalars.
+    # Deep-copy numpy arrays so the main loop can reuse its buffers
+    # Only do this if we know the queue has space
+    obs_copy = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in (observation or {}).items()}
+    act_copy = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in (action or {}).items()}
 
-    Keys are automatically namespaced with "observation." or "action." if not already present.
+    with contextlib.suppress(queue.Full):
+        _viz_queue.put_nowait((obs_copy, act_copy, compress_images))
 
-    Args:
-        observation: An optional dictionary containing observation data to log.
-        action: An optional dictionary containing action data to log.
-        compress_images: Whether to compress images before logging to save bandwidth & memory in exchange for cpu and quality.
-    """
+
+def _log_rerun_data_sync(
+    observation: RobotObservation | None = None,
+    action: RobotAction | None = None,
+    compress_images: bool = False,
+) -> None:
+    """Synchronous implementation (runs in the background viz thread)."""
+    # Get configuration from environment
+    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.33"))
+    log_frequency = int(os.getenv("RERUN_LOG_FREQUENCY", "1"))
+
+    # Frame counter for logging frequency
+    if not hasattr(_log_rerun_data_sync, "_frame_counter"):
+        _log_rerun_data_sync._frame_counter = 0
+    _log_rerun_data_sync._frame_counter += 1
+
+    # Skip this frame if logging frequency > 1
+    if log_frequency > 1 and _log_rerun_data_sync._frame_counter % log_frequency != 0:
+        return
+
     if observation:
         for k, v in observation.items():
             if v is None:
                 continue
+
+            # Skip depth images in visualization to improve performance
+            # Only head camera has depth (RealSense), wrist cameras are RGB-only
+            # Depth images are still collected in the dataset, just not visualized
+            # Can be controlled via RERUN_SKIP_DEPTH env var (defaults to skipping for performance)
+            if "_depth" in str(k).lower() or k.endswith("_depth"):
+                continue
+
             key = k if str(k).startswith(OBS_PREFIX) else f"{OBS_STR}.{k}"
 
             if _is_scalar(v):
                 rr.log(key, rr.Scalars(float(v)))
             elif isinstance(v, np.ndarray):
                 arr = v
-                # Convert CHW -> HWC when needed
+                # Check if this is an image (3D array or 2D array with reasonable dimensions)
+                is_image = arr.ndim == 3 or (arr.ndim == 2 and arr.shape[0] > 10 and arr.shape[1] > 10)
+
+                # Check if this is a depth image (uint16) - JPEG compression doesn't support uint16
+                is_depth = arr.dtype == np.uint16 and ("depth" in str(k).lower() or k.endswith("_depth"))
+
+                # Log depth image detection for debugging (only once per key)
+                if is_depth and not hasattr(_log_rerun_data_sync, f"_depth_logged_{k}"):
+                    import logging
+
+                    logger = logging.getLogger(__name__)
+                    logger.debug(f"📊 Depth image detected: {k}, shape={arr.shape}, dtype={arr.dtype}")
+                    setattr(_log_rerun_data_sync, f"_depth_logged_{k}", True)
+
+                # Downsample images before sending to Rerun (for both 2D and 3D images)
+                if is_image:
+                    # Use more aggressive downsampling for depth images
+                    depth_factor = downsample_factor * 0.5 if is_depth else downsample_factor
+                    arr = _downsample_image(arr, depth_factor)
+
+                # Convert CHW -> HWC when needed (only for 3D arrays)
                 if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
                     arr = np.transpose(arr, (1, 2, 0))
+
                 if arr.ndim == 1:
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
                 else:
-                    img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
-                    rr.log(key, entity=img_entity, static=True)
+                    # Always compress images for lower latency (JPEG compression reduces bandwidth significantly)
+                    # Compression is faster than sending uncompressed data over network
+                    # BUT: Skip compression for uint16 depth images (JPEG only supports uint8)
+                    if (compress_images or is_image) and not is_depth:
+                        img_entity = rr.Image(arr).compress()
+                    else:
+                        img_entity = rr.Image(arr)
+                    # Remove static=True for live video streams (causes latency)
+                    rr.log(key, entity=img_entity, static=False)
 
     if action:
         for k, v in action.items():

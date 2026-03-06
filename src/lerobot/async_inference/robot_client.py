@@ -101,6 +101,7 @@ class RobotClient:
             lerobot_features,
             config.actions_per_chunk,
             config.policy_device,
+            rename_map=config.rename_map,
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -277,8 +278,23 @@ class RobotClient:
                 receive_time = time.time()
 
                 # Deserialize bytes back into list[TimedAction]
+                # Map CUDA tensors to CPU since actions are serialized on server with CUDA
                 deserialize_start = time.perf_counter()
-                timed_actions = pickle.loads(actions_chunk.data)  # nosec
+                # Override torch's default_restore_location to map CUDA to CPU
+                original_restore = torch.serialization.default_restore_location
+
+                def cpu_restore_location(storage, location, _restore=original_restore):
+                    if isinstance(location, str) and location.startswith("cuda"):
+                        location = "cpu"
+                    elif isinstance(location, torch.device) and location.type == "cuda":
+                        location = torch.device("cpu")
+                    return _restore(storage, location)
+
+                torch.serialization.default_restore_location = cpu_restore_location
+                try:
+                    timed_actions = pickle.loads(actions_chunk.data)  # nosec
+                finally:
+                    torch.serialization.default_restore_location = original_restore
                 deserialize_time = time.perf_counter() - deserialize_start
 
                 # Log device type of received actions
@@ -359,7 +375,22 @@ class RobotClient:
             return not self.action_queue.empty()
 
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
-        action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
+        """Convert action tensor to robot action dictionary.
+
+        Handles dimension mismatches by using only the available action dimensions
+        and setting remaining features to 0 (no movement).
+        """
+        action_features_list = list(self.robot.action_features)
+        action = {}
+
+        # Use available action dimensions from the policy
+        for i, key in enumerate(action_features_list):
+            if i < action_tensor.shape[0]:
+                action[key] = action_tensor[i].item()
+            else:
+                # For dimensions beyond policy output, set to 0 (no movement)
+                action[key] = 0.0
+
         return action
 
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
@@ -411,10 +442,14 @@ class RobotClient:
             with self.latest_action_lock:
                 latest_action = self.latest_action
 
+            # CRITICAL: Use current timestep, not latest_action, to avoid stale observation-action mismatch
+            # The observation should reflect the CURRENT robot state, not the state when last action was executed
+            # Using latest_action here causes the policy to predict actions for a state that no longer exists
+            current_timestep = max(latest_action + 1, 0)  # Next timestep after latest action
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
                 observation=raw_observation,
-                timestep=max(latest_action, 0),
+                timestep=current_timestep,
             )
 
             obs_capture_time = time.perf_counter() - start_time
