@@ -182,14 +182,12 @@ class DatasetRecordConfig:
     # Number of threads writing the frames as png images on disk, per camera.
     # Too many threads might cause unstable teleoperation fps due to main thread being blocked.
     # Not enough threads might cause low camera fps.
-    num_image_writer_threads_per_camera: int = 4
+    num_image_writer_threads_per_camera: int = 2
     # Number of episodes to record before batch encoding videos
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
-    # Video codec for encoding videos. Options: 'h264', 'hevc', 'libsvtav1', 'auto',
-    # or hardware-specific: 'h264_videotoolbox', 'h264_nvenc', 'h264_vaapi', 'h264_qsv'.
-    # Use 'auto' to auto-detect the best available hardware encoder.
-    vcodec: str = "libsvtav1"
+    # Video codec for encoding videos.
+    vcodec: str = "h264"
     # Enable streaming video encoding: encode frames in real-time during capture instead
     # of writing PNG images first. Makes save_episode() near-instant. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding
     streaming_encoding: bool = False
@@ -197,7 +195,7 @@ class DatasetRecordConfig:
     # ~1s buffer at 30fps. Provides backpressure if the encoder can't keep up.
     encoder_queue_maxsize: int = 30
     # Number of threads per encoder instance. None = auto (codec default).
-    # Lower values reduce CPU usage, maps to 'lp' (via svtav1-params) for libsvtav1 and 'threads' for h264/hevc..
+    # Lower values reduce CPU usage, maps to 'lp' (via svtav1-params) for libsvtav1 and 'threads' for h264/hevc.
     encoder_threads: int | None = None
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
@@ -338,6 +336,12 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
+    frame_idx = 0
+
+    # Depth read throttling: set to 1 to read depth every frame.
+    depth_read_interval = 1  # Read depth every frame
+    last_depth_obs = {}  # Store last depth observation for frames where we skip depth
+
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
@@ -345,8 +349,15 @@ def record_loop(
             events["exit_early"] = False
             break
 
-        # Get robot observation
-        obs = robot.get_observation()
+        # Get robot observation - skip depth reads on some frames for performance
+        read_depth_this_frame = frame_idx % depth_read_interval == 0
+        obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
+
+        # If we skipped depth this frame, merge last depth observation
+        if not read_depth_this_frame and last_depth_obs:
+            obs.update(last_depth_obs)
+        elif read_depth_this_frame:
+            last_depth_obs = {k: v for k, v in obs.items() if k.endswith("_depth")}
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
@@ -406,6 +417,9 @@ def record_loop(
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
+        # Use the actually sent action for logging (includes normalization, clipping, etc.)
+        action_values = _sent_action
+
         # Write to dataset
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
@@ -413,8 +427,13 @@ def record_loop(
             dataset.add_frame(frame)
 
         if display_data:
+            obs_for_rerun = {
+                k: v
+                for k, v in obs_processed.items()
+                if not ("depth" in str(k).lower() or k.endswith("_depth"))
+            }
             log_rerun_data(
-                observation=obs_processed, action=action_values, compress_images=display_compressed_images
+                observation=obs_for_rerun, action=action_values, compress_images=display_compressed_images
             )
 
         dt_s = time.perf_counter() - start_loop_t
@@ -428,6 +447,7 @@ def record_loop(
         precise_sleep(max(sleep_time_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
+        frame_idx += 1
 
 
 @parser.wrap()
