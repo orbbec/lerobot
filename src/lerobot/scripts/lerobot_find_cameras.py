@@ -47,8 +47,8 @@ try:
     from lerobot.cameras.orbbec.camera_orbbec import OrbbecCamera
     from lerobot.cameras.orbbec.configuration_orbbec import OrbbecCameraConfig
 except ImportError:
-    OrbbecCamera = None
-    OrbbecCameraConfig = None
+    OrbbecCamera = None  # type: ignore[assignment,misc]
+    OrbbecCameraConfig = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +106,7 @@ def find_all_orbbec_cameras() -> list[dict[str, Any]]:
     logger.info("Searching for Orbbec cameras...")
     try:
         if OrbbecCamera is None:
-            logger.warning("Skipping Orbbec camera search: pyorbbecsdk2 library not found or not importable.")
-            return all_orbbec_cameras_info
+            raise ImportError("pyorbbecsdk2 not installed")
         orbbec_cameras = OrbbecCamera.find_cameras()
         for cam_info in orbbec_cameras:
             all_orbbec_cameras_info.append(cam_info)
@@ -209,8 +208,8 @@ def create_camera_instance(cam_meta: dict[str, Any]) -> dict[str, Any] | None:
             )
             instance = RealSenseCamera(rs_config)
         elif cam_type == "Orbbec":
-            if OrbbecCamera is None or OrbbecCameraConfig is None:
-                logger.warning(f"pyorbbecsdk2 not available, skipping Orbbec camera {cam_id}.")
+            if OrbbecCameraConfig is None or OrbbecCamera is None:
+                logger.warning(f"pyorbbecsdk2 not installed, cannot connect to Orbbec camera {cam_id}.")
                 return None
             ob_config = OrbbecCameraConfig(
                 index_or_serial_number=cam_id,

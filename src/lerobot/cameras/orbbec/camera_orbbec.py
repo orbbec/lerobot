@@ -15,24 +15,17 @@
 """
 Provides the OrbbecCamera class for capturing frames from Orbbec cameras.
 
-Uses the ``pyorbbecsdk2`` (2.0.18) Python bindings which wrap the Orbbec SDK v2.
-
-Architecture follows RealSenseCamera:
-- Background thread continuously reads from hardware, storing latest frames.
-- ``read()`` / ``read_depth()`` delegate to ``async_read()`` / the background cache.
-- Color and depth are extracted from the **same** FrameSet for frame-level synchronisation.
-- Depth output shape is ``(H, W, 1)`` uint16, matching RealSense conventions.
-- Independent ``new_depth_frame_event`` for depth consumers.
+Uses the ``pyorbbecsdk`` (2.0.18) Python bindings which wrap the Orbbec SDK v2.
 """
 
 import logging
 import time
 from threading import Event, Lock, Thread
-from typing import Any, Optional
+from typing import Any
 
-import cv2  # type: ignore
-import numpy as np  # type: ignore
-from numpy.typing import NDArray  # type: ignore
+import cv2
+import numpy as np
+from numpy.typing import NDArray
 
 try:
     from pyorbbecsdk import (
@@ -53,160 +46,131 @@ try:
         VideoStreamProfile,
     )
 except Exception as e:
-    logging.info(f"Could not import pyorbbecsdk2: {e}")
+    logging.info(f"Could not import pyorbbecsdk: {e}")
 
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..camera import Camera
 from ..configs import ColorMode
 from ..utils import get_cv2_rotation
-from .configuration_orbbec import OrbbecCameraConfig
+from .configuration_orbbec import D2CMode, OrbbecCameraConfig
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Frame-format conversion helpers
+# Frame-format conversion helper
 # ---------------------------------------------------------------------------
 
-def _frame_to_rgb_image(frame: "VideoFrame") -> Optional[NDArray[np.uint8]]:
+# Maps Orbbec pixel formats to the SDK's FormatConvertFilter target.
+# Mirrors ``determine_convert_format`` in pyorbbecsdk/examples/utils.py.
+_CONVERT_FORMAT_MAP: dict = {}
+_CONVERT_FILTER_CACHE: dict = {}
+
+
+def _build_convert_map() -> None:
+    """Populate _CONVERT_FORMAT_MAP once the SDK is imported."""
+    global _CONVERT_FORMAT_MAP
+    _CONVERT_FORMAT_MAP = {
+        OBFormat.I420: OBConvertFormat.I420_TO_RGB888,
+        OBFormat.NV12: OBConvertFormat.NV12_TO_RGB888,
+        OBFormat.NV21: OBConvertFormat.NV21_TO_RGB888,
+        OBFormat.MJPG: OBConvertFormat.MJPG_TO_RGB888,
+        OBFormat.YUYV: OBConvertFormat.YUYV_TO_RGB888,
+        OBFormat.UYVY: OBConvertFormat.UYVY_TO_RGB888,
+    }
+
+
+def _frame_to_rgb_image(frame: "VideoFrame") -> "NDArray[np.uint8] | None":
     """Convert an Orbbec ``VideoFrame`` to an RGB ``np.ndarray`` (H, W, 3).
 
-    Handles the most common Orbbec color formats:
-        RGB, BGR, YUYV, UYVY, MJPG, I420, NV12, NV21.
-
-    Returns ``None`` when the format is unsupported.
+    Follows the same pattern as ``frame_to_bgr_image`` in
+    ``pyorbbecsdk/examples/utils.py``, but returns RGB instead of BGR.
+    Returns ``None`` when conversion fails.
     """
     width = frame.get_width()
     height = frame.get_height()
     fmt = frame.get_format()
-    data = np.asanyarray(frame.get_data())
+    data = np.frombuffer(frame.get_data(), dtype=np.uint8)
 
     if fmt == OBFormat.RGB:
         return data.reshape((height, width, 3))
 
     if fmt == OBFormat.BGR:
-        bgr = data.reshape((height, width, 3))
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return cv2.cvtColor(data.reshape((height, width, 3)), cv2.COLOR_BGR2RGB)
 
-    if fmt == OBFormat.YUYV:
-        yuyv = data.reshape((height, width, 2))
-        bgr = cv2.cvtColor(yuyv, cv2.COLOR_YUV2BGR_YUY2)
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    # All other formats: delegate to FormatConvertFilter (SDK-recommended path)
+    if not _CONVERT_FORMAT_MAP:
+        _build_convert_map()
 
-    if fmt == OBFormat.UYVY:
-        uyvy = data.reshape((height, width, 2))
-        bgr = cv2.cvtColor(uyvy, cv2.COLOR_YUV2BGR_UYVY)
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    convert_fmt = _CONVERT_FORMAT_MAP.get(fmt)
+    if convert_fmt is None:
+        logger.warning(f"Unsupported Orbbec color format: {fmt}")
+        return None
 
-    if fmt == OBFormat.MJPG:
-        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if bgr is None:
-            return None
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    if fmt == OBFormat.NV12:
-        y = data[0:height, :]
-        uv = data[height : height + height // 2].reshape(height // 2, width)
-        yuv = cv2.merge([y, uv])
-        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    if fmt == OBFormat.NV21:
-        y = data[0:height, :]
-        uv = data[height : height + height // 2].reshape(height // 2, width)
-        yuv = cv2.merge([y, uv])
-        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV21)
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    if fmt == OBFormat.I420:
-        y = data[0:height, :]
-        u = data[height : height + height // 4].reshape(height // 2, width // 2)
-        v = data[height + height // 4 :].reshape(height // 2, width // 2)
-        yuv = cv2.merge([y, u, v])
-        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    # Try using SDK's built-in FormatConvertFilter as a last resort
     try:
-        convert_filter = FormatConvertFilter()
-        convert_filter.set_format_convert_format(OBConvertFormat.MJPG_TO_RGB888)
-        rgb_frame = convert_filter.process(frame)
-        if rgb_frame is not None:
-            rgb_data = np.asanyarray(rgb_frame.get_data())
-            return rgb_data.reshape((height, width, 3))
-    except Exception:
-        pass
-
-    logger.warning(f"Unsupported Orbbec color format: {fmt}")
-    return None
+        f = _CONVERT_FILTER_CACHE.get(convert_fmt)
+        if f is None:
+            f = FormatConvertFilter()
+            f.set_format_convert_format(convert_fmt)
+            _CONVERT_FILTER_CACHE[convert_fmt] = f
+        rgb_frame = f.process(frame)
+        if rgb_frame is None:
+            return None
+        rgb_data = np.frombuffer(rgb_frame.get_data(), dtype=np.uint8)
+        return rgb_data.reshape((height, width, 3))
+    except Exception as e:
+        logger.debug(f"FormatConvertFilter failed for {fmt}: {e}")
+        return None
 
 
 # ===========================================================================
 # OrbbecCamera
 # ===========================================================================
 
-class OrbbecCamera(Camera):
-    """Manages interactions with Orbbec depth cameras via ``pyorbbecsdk2``.
 
-    Architecture mirrors :class:`RealSenseCamera`:
+class OrbbecCamera(Camera):
+    """Manages interactions with Orbbec depth cameras via ``pyorbbecsdk`` (2.0.18).
 
     * A **background thread** continuously reads FrameSets from the pipeline.
-    * Color and depth frames are extracted from the **same** FrameSet,
-      guaranteeing frame-level temporal synchronisation.
-    * ``read()`` and ``read_depth()`` delegate to the background cache
-      (via ``async_read()``), not directly to the pipeline.
-    * Depth output has shape ``(H, W, 1)`` uint16 (millimetres),
-      matching RealSense conventions and dataset feature-shape expectations.
-    * An independent ``new_depth_frame_event`` notifies depth consumers
-      without coupling to colour frame timing.
-
-    Orbbec-specific additions over RealSense:
-    * ``align_depth`` — optional depth-to-color alignment via ``AlignFilter``.
-    * Multi-format color conversion (RGB, BGR, YUYV, MJPG, NV12, …).
+    * Color and depth are extracted from the **same** FrameSet for frame-level sync.
+    * Depth output shape is ``(H, W, 1)`` uint16 (millimetres).
+    * When ``align_depth=True``, hardware D2C alignment is attempted first
+      (``OBAlignMode.HW_MODE`` via ``get_d2c_depth_profile_list``); falls back
+      to software ``AlignFilter`` if hardware mode is unavailable.
 
     Example::
 
-        from lerobot.cameras.orbbec import OrbbecCamera, OrbbecCameraConfig
-
-        config = OrbbecCameraConfig(index_or_serial_number=0, fps=30,
-                                     width=640, height=480,
-                                     use_depth=True, align_depth=True)
+        config = OrbbecCameraConfig(
+            index_or_serial_number=0, fps=30, width=640, height=480, use_depth=True, align_depth=True
+        )
         cam = OrbbecCamera(config)
         cam.connect()
-
-        color = cam.async_read()            # (480, 640, 3) RGB  uint8
-        depth = cam.async_read_depth()      # (480, 640, 1) uint16 mm
-
+        color = cam.async_read()  # (480, 640, 3) RGB uint8
+        depth = cam.async_read_depth()  # (480, 640, 1) uint16 mm
         cam.disconnect()
     """
-
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
 
     def __init__(self, config: OrbbecCameraConfig):
         super().__init__(config)
         self.config = config
 
-        # Device identification ------------------------------------------------
         self.index_or_serial_number: int | str = config.index_or_serial_number
-        self.serial_number: str | None = None  # resolved during connect()
+        self.serial_number: str | None = None
 
-        # Stream parameters ----------------------------------------------------
         self.fps = config.fps
         self.color_mode: ColorMode = config.color_mode
         self.use_depth: bool = config.use_depth
         self.align_depth: bool = config.align_depth
+        self.d2c_mode: D2CMode = config.d2c_mode
         self.warmup_s: int = config.warmup_s
 
-        # SDK objects (populated in connect()) ---------------------------------
-        self._pipeline: Optional["Pipeline"] = None
-        self._config: Optional["Config"] = None
-        self._align_filter: Optional["AlignFilter"] = None
-        self._has_color_sensor: bool = False
+        # SDK objects (populated in connect())
+        self._pipeline: Pipeline | None = None
+        self._config: Config | None = None
+        self._align_filter: AlignFilter | None = None  # software fallback only
 
-        # Async read infrastructure (mirrors RealSense naming) -----------------
+        # Background read thread
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
@@ -216,31 +180,17 @@ class OrbbecCamera(Camera):
         self.new_frame_event: Event = Event()
         self.new_depth_frame_event: Event = Event()
 
-        # Rotation handling ----------------------------------------------------
+        # Rotation & capture dimensions
         self.rotation: int | None = get_cv2_rotation(config.rotation)
-        self.capture_width: int | None = None
-        self.capture_height: int | None = None
-
-        if self.height and self.width:
-            self.capture_width, self.capture_height = self.width, self.height
-            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-                self.capture_width, self.capture_height = self.height, self.width
-
-    # ------------------------------------------------------------------
-    # Dunder helpers
-    # ------------------------------------------------------------------
+        self.capture_width: int | None = config.width
+        self.capture_height: int | None = config.height
 
     def __str__(self) -> str:
-        tag = self.serial_number if self.serial_number else self.index_or_serial_number
+        tag = self.serial_number or self.index_or_serial_number
         return f"{self.__class__.__name__}({tag})"
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
 
     @property
     def is_connected(self) -> bool:
-        """``True`` when the Orbbec pipeline has been started successfully."""
         return self._pipeline is not None
 
     # ------------------------------------------------------------------
@@ -251,27 +201,24 @@ class OrbbecCamera(Camera):
     def find_cameras() -> list[dict[str, Any]]:
         """Detect all connected Orbbec cameras.
 
-        Returns:
-            A list of dicts, each containing at least::
+        Probes each device's sensor list to report color/depth availability
+        and default stream profiles — useful when configuring multi-camera setups.
 
-                {
-                    "type": "Orbbec",
-                    "index": <int>,
-                    "name": <str>,
-                    "id": <serial_number_str>,
-                    ...
-                }
+        Returns:
+            List of dicts, one per device, with keys:
+            ``type``, ``index``, ``name``, ``id``, ``pid``, ``vid``,
+            ``connection_type``, ``has_color_sensor``, ``has_depth_sensor``,
+            ``default_color_profile``, ``default_depth_profile``.
         """
-        found: list[dict[str, Any]] = []
         ctx = Context()
         device_list = ctx.query_devices()
-        count = device_list.get_count()
+        found: list[dict[str, Any]] = []
 
-        for idx in range(count):
-            device = device_list.get_device_by_index(idx)
+        for idx in range(device_list.get_count()):
+            device = device_list[idx]
             info = device.get_device_info()
 
-            cam_info: dict[str, Any] = {
+            cam: dict[str, Any] = {
                 "type": "Orbbec",
                 "index": idx,
                 "name": info.get_name(),
@@ -285,96 +232,103 @@ class OrbbecCamera(Camera):
                 "default_depth_profile": None,
             }
 
-            # Probe sensors
             sensor_list = device.get_sensor_list()
-            for si in range(sensor_list.get_count()):
-                sensor = sensor_list.get_sensor_by_index(si)
-                stype = sensor.get_type()
-                if stype == OBSensorType.COLOR_SENSOR:
-                    cam_info["has_color_sensor"] = True
-                    try:
-                        tmp_pipeline = Pipeline(device)
-                        plist = tmp_pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-                        dp: VideoStreamProfile = plist.get_default_video_stream_profile()
-                        cam_info["default_color_profile"] = {
-                            "width": dp.get_width(),
-                            "height": dp.get_height(),
-                            "fps": dp.get_fps(),
-                            "format": str(dp.get_format()),
-                        }
-                    except Exception:
-                        pass
-                elif stype == OBSensorType.DEPTH_SENSOR:
-                    cam_info["has_depth_sensor"] = True
-                    try:
-                        tmp_pipeline = Pipeline(device)
-                        plist = tmp_pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-                        dp = plist.get_default_video_stream_profile()
-                        cam_info["default_depth_profile"] = {
-                            "width": dp.get_width(),
-                            "height": dp.get_height(),
-                            "fps": dp.get_fps(),
-                            "format": str(dp.get_format()),
-                        }
-                    except Exception:
-                        pass
+            pipeline = Pipeline(device)
 
-            found.append(cam_info)
+            for si in range(sensor_list.get_count()):
+                stype = sensor_list.get_sensor_by_index(si).get_type()
+
+                if stype == OBSensorType.COLOR_SENSOR:
+                    cam["has_color_sensor"] = True
+                    try:
+                        dp: VideoStreamProfile = pipeline.get_stream_profile_list(
+                            OBSensorType.COLOR_SENSOR
+                        ).get_default_video_stream_profile()
+                        cam["default_color_profile"] = {
+                            "width": dp.get_width(),
+                            "height": dp.get_height(),
+                            "fps": dp.get_fps(),
+                            "format": str(dp.get_format()),
+                        }
+                    except Exception as e:
+                        logger.debug(f"Could not query color profile for device {idx}: {e}")
+
+                elif stype == OBSensorType.DEPTH_SENSOR:
+                    cam["has_depth_sensor"] = True
+                    try:
+                        dp = pipeline.get_stream_profile_list(
+                            OBSensorType.DEPTH_SENSOR
+                        ).get_default_video_stream_profile()
+                        cam["default_depth_profile"] = {
+                            "width": dp.get_width(),
+                            "height": dp.get_height(),
+                            "fps": dp.get_fps(),
+                            "format": str(dp.get_format()),
+                        }
+                    except Exception as e:
+                        logger.debug(f"Could not query depth profile for device {idx}: {e}")
+
+            found.append(cam)
 
         return found
 
     # ------------------------------------------------------------------
-    # Connection
+    # Connection helpers
     # ------------------------------------------------------------------
 
     def _resolve_device(self) -> Any:
-        """Return the ``Device`` object that matches ``self.index_or_serial_number``."""
+        """Return the ``Device`` matching ``self.index_or_serial_number``."""
         ctx = Context()
         device_list = ctx.query_devices()
         count = device_list.get_count()
 
         if count == 0:
-            raise ConnectionError(
-                "No Orbbec device found. Run `lerobot-find-cameras orbbec` to check."
-            )
+            raise ConnectionError("No Orbbec device found. Run `lerobot-find-cameras orbbec` to check.")
 
-        # --- by integer index ---
         if isinstance(self.index_or_serial_number, int):
             if self.index_or_serial_number >= count:
                 raise ConnectionError(
-                    f"Requested device index {self.index_or_serial_number}, "
-                    f"but only {count} Orbbec device(s) connected."
+                    f"Device index {self.index_or_serial_number} out of range ({count} device(s) connected)."
                 )
-            device = device_list.get_device_by_index(self.index_or_serial_number)
+            device = device_list[self.index_or_serial_number]
             self.serial_number = device.get_device_info().get_serial_number()
             return device
 
-        # --- by serial number ---
         for i in range(count):
-            device = device_list.get_device_by_index(i)
+            device = device_list[i]
             sn = device.get_device_info().get_serial_number()
             if sn == self.index_or_serial_number:
                 self.serial_number = sn
                 return device
 
-        available_sns = []
-        for i in range(count):
-            d = device_list.get_device_by_index(i)
-            available_sns.append(d.get_device_info().get_serial_number())
         raise ConnectionError(
-            f"No Orbbec device with serial number '{self.index_or_serial_number}'. "
-            f"Available: {available_sns}. Use `lerobot-find-cameras orbbec`."
+            f"No Orbbec device with serial '{self.index_or_serial_number}'. "
+            f"Use `lerobot-find-cameras orbbec` to list available devices."
         )
 
     def _configure_pipeline(self, device: Any) -> None:
-        """Create ``Pipeline`` + ``Config`` for the resolved *device*."""
-        self._pipeline = Pipeline(device)
-        self._config = Config()
+        """Build ``Pipeline`` + ``Config`` for *device* and resolve stream dimensions.
+
+        Color stream:
+            Tries the requested (width, height, fps) in RGB format first,
+            then any format, then falls back to the sensor default.
+
+        Depth stream (when ``use_depth=True``):
+            When ``align_depth=True``:
+                1. Queries hardware-aligned depth profiles via
+                   ``get_d2c_depth_profile_list(color_profile, OBAlignMode.HW_MODE)``.
+                2. If HW profiles are found, sets ``config.set_align_mode(HW_MODE)``.
+                3. Otherwise falls back to software ``AlignFilter``.
+            Frame sync is enabled with ``pipeline.enable_frame_sync()`` and
+            ``OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE``.
+        """
+        pipeline = Pipeline(device)
+        config = Config()
 
         # --- Color stream ---
         try:
-            profile_list = self._pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-            if self.fps and self.capture_width and self.capture_height:
+            profile_list = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+            if self.fps is not None and self.capture_width is not None and self.capture_height is not None:
                 try:
                     color_profile: VideoStreamProfile = profile_list.get_video_stream_profile(
                         self.capture_width, self.capture_height, OBFormat.RGB, self.fps
@@ -387,7 +341,7 @@ class OrbbecCamera(Camera):
                     except OBError:
                         color_profile = profile_list.get_default_video_stream_profile()
                         logger.warning(
-                            f"{self}: Requested colour profile "
+                            f"{self}: requested color profile "
                             f"{self.capture_width}x{self.capture_height}@{self.fps} not available; "
                             f"using default {color_profile.get_width()}x"
                             f"{color_profile.get_height()}@{color_profile.get_fps()}."
@@ -395,512 +349,357 @@ class OrbbecCamera(Camera):
             else:
                 color_profile = profile_list.get_default_video_stream_profile()
 
-            self._config.enable_stream(color_profile)
-            self._has_color_sensor = True
+            config.enable_stream(color_profile)
+
+            # Store actual stream dimensions
+            self.capture_width = color_profile.get_width()
+            self.capture_height = color_profile.get_height()
+            if self.fps is None:
+                self.fps = color_profile.get_fps()
+            if self.rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE):
+                self.width, self.height = self.capture_height, self.capture_width
+            else:
+                self.width, self.height = self.capture_width, self.capture_height
+
         except OBError as e:
-            logger.warning(f"{self}: No color sensor available – {e}")
-            self._has_color_sensor = False
+            raise ConnectionError(f"{self}: no color sensor – {e}") from e
 
         # --- Depth stream (optional) ---
         if self.use_depth:
             try:
-                profile_list = self._pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-                if self.fps and self.capture_width and self.capture_height:
-                    try:
-                        depth_profile = profile_list.get_video_stream_profile(
-                            self.capture_width, self.capture_height, OBFormat.UNKNOWN_FORMAT, self.fps
-                        )
-                    except OBError:
-                        depth_profile = profile_list.get_default_video_stream_profile()
-                        logger.warning(
-                            f"{self}: Requested depth profile not available; using default."
-                        )
+                depth_profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+
+                if self.align_depth:
+                    if self.d2c_mode == D2CMode.SOFTWARE:
+                        depth_profile = depth_profile_list.get_default_video_stream_profile()
+                        self._align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
+                        logger.info(f"{self}: software D2C alignment enabled.")
+                    else:
+                        # Prefer hardware D2C alignment by default
+                        try:
+                            hw_profiles = pipeline.get_d2c_depth_profile_list(
+                                color_profile, OBAlignMode.HW_MODE
+                            )
+                            if hw_profiles and len(hw_profiles) > 0:
+                                depth_profile = hw_profiles[0]
+                                config.set_align_mode(OBAlignMode.HW_MODE)
+                                logger.info(f"{self}: hardware D2C alignment enabled.")
+                            else:
+                                raise RuntimeError("No HW D2C profiles available.")
+                        except Exception as hw_err:
+                            logger.warning(
+                                f"{self}: hardware D2C unavailable ({hw_err}); "
+                                f"falling back to software AlignFilter."
+                            )
+                            depth_profile = depth_profile_list.get_default_video_stream_profile()
+                            self._align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
                 else:
-                    depth_profile = profile_list.get_default_video_stream_profile()
-                self._config.enable_stream(depth_profile)
+                    depth_profile = depth_profile_list.get_default_video_stream_profile()
+
+                config.enable_stream(depth_profile)
+                config.set_frame_aggregate_output_mode(OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE)
+                try:
+                    pipeline.enable_frame_sync()
+                except Exception as e:
+                    logger.debug(f"{self}: enable_frame_sync not supported: {e}")
+
             except OBError as e:
-                raise ConnectionError(
-                    f"{self}: use_depth=True but no depth sensor found – {e}"
-                ) from e
+                raise ConnectionError(f"{self}: use_depth=True but no depth sensor – {e}") from e
 
-            # Require full frame set so colour & depth are synchronised
-            try:
-                self._config.set_frame_aggregate_output_mode(
-                    OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE
-                )
-            except Exception:
-                pass  # Not all FW versions support this; best-effort
-        else:
-            # Explicitly disable depth stream to save USB bandwidth
-            try:
-                self._config.disable_stream(OBStreamType.DEPTH_STREAM)
-            except Exception:
-                pass  # Best-effort; some FW versions may not support this
-            logger.info(f"{self}: depth stream disabled (use_depth=False).")
-
-        # --- Depth alignment ---
-        if self.align_depth:
-            try:
-                self._align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
-            except Exception as e:
-                logger.warning(f"{self}: Could not create AlignFilter – {e}")
-                self._align_filter = None
-
-    def _configure_capture_settings(self) -> None:
-        """Infer ``fps``, ``width``, ``height`` from the active stream when not set."""
-        if self._pipeline is None:
-            raise DeviceNotConnectedError(f"Cannot configure capture settings: {self} not connected.")
-
-        if self._has_color_sensor:
-            try:
-                profile_list = self._pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-                vp: VideoStreamProfile = profile_list.get_default_video_stream_profile()
-                actual_w, actual_h, actual_fps = vp.get_width(), vp.get_height(), vp.get_fps()
-            except Exception:
-                actual_w, actual_h, actual_fps = 640, 480, 30
-        else:
-            try:
-                profile_list = self._pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-                vp = profile_list.get_default_video_stream_profile()
-                actual_w, actual_h, actual_fps = vp.get_width(), vp.get_height(), vp.get_fps()
-            except Exception:
-                actual_w, actual_h, actual_fps = 640, 480, 30
-
-        if self.fps is None:
-            self.fps = actual_fps
-
-        if self.width is None or self.height is None:
-            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-                self.width, self.height = actual_h, actual_w
-            else:
-                self.width, self.height = actual_w, actual_h
-            self.capture_width, self.capture_height = actual_w, actual_h
+        self._pipeline = pipeline
+        self._config = config
 
     def connect(self, warmup: bool = True) -> None:
-        """Open the Orbbec device, configure streams, start pipeline and background thread.
-
-        Follows the RealSense pattern: pipeline.start() → _start_read_thread() →
-        warmup via async_read() → validate frames available.
+        """Open the device, configure streams, start pipeline and read thread.
 
         Args:
-            warmup: If *True* (default), read & discard frames for ``warmup_s``
-                seconds so auto-exposure / white-balance can settle.
+            warmup: Discard frames for ``warmup_s`` seconds so auto-exposure settles.
 
         Raises:
             DeviceAlreadyConnectedError: If already connected.
-            ConnectionError: If the device cannot be found or started.
+            ConnectionError: If the device cannot be found or pipeline fails to start.
         """
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} is already connected.")
 
         device = self._resolve_device()
         self._configure_pipeline(device)
-        self._configure_capture_settings()
 
+        assert self._pipeline is not None and self._config is not None
         try:
-            assert self._pipeline is not None and self._config is not None
             self._pipeline.start(self._config)
         except Exception as e:
             self._pipeline = None
             self._config = None
-            raise ConnectionError(
-                f"Failed to start pipeline for {self}. "
-                f"Run `lerobot-find-cameras orbbec` to list available devices."
-            ) from e
+            raise ConnectionError(f"Failed to start pipeline for {self}.") from e
 
-        # Start background read thread (RealSense style: eager, not lazy)
         self._start_read_thread()
 
-        # Warmup — at least 1 second (same as RealSense)
-        if warmup:
-            self.warmup_s = max(self.warmup_s, 1)
-            start_time = time.time()
-            while time.time() - start_time < self.warmup_s:
+        try:
+            if warmup:
+                self.warmup_s = max(self.warmup_s, 1)
+                deadline = time.time() + self.warmup_s
+                while time.time() < deadline:
+                    self.new_frame_event.wait(timeout=0.1)
+                    self.new_frame_event.clear()
+
+                with self.frame_lock:
+                    if self.latest_color_frame is None or (
+                        self.use_depth and self.latest_depth_frame is None
+                    ):
+                        raise ConnectionError(f"{self} failed to capture frames during warmup.")
+        except Exception:
+            self._stop_read_thread()
+            if self._pipeline is not None:
                 try:
-                    self.async_read(timeout_ms=self.warmup_s * 1000)
-                except Exception:
-                    pass
-                time.sleep(0.1)
+                    self._pipeline.stop()
+                except Exception as stop_err:
+                    logger.warning(f"{self} pipeline.stop() error after failed connect: {stop_err}")
+            self._pipeline = None
+            self._config = None
+            self._align_filter = None
+            raise
 
-            with self.frame_lock:
-                warmup_ok = True
-                warmup_msg = ""
-                if self.latest_color_frame is None:
-                    warmup_ok = False
-                    warmup_msg = f"{self} failed to capture color frames during warmup."
-                elif self.use_depth and self.latest_depth_frame is None:
-                    warmup_ok = False
-                    warmup_msg = f"{self} failed to capture depth frames during warmup."
-
-            if not warmup_ok:
-                # Clean up pipeline & thread so device is properly released
-                try:
-                    self.disconnect()
-                except Exception:
-                    pass
-                raise ConnectionError(warmup_msg)
-
-        logger.info(f"{self} connected (color={self._has_color_sensor}, depth={self.use_depth}).")
+        logger.info(f"{self} connected (depth={self.use_depth}, align={self.align_depth}).")
 
     # ------------------------------------------------------------------
-    # Hardware read (called by background thread only)
+    # Hardware read
     # ------------------------------------------------------------------
 
-    def _read_from_hardware(self, timeout_ms: int = 10000) -> "FrameSet":
-        """Read a FrameSet from the Orbbec pipeline.
-
-        Applies ``AlignFilter`` if configured.
-
-        Returns:
-            Aligned (or raw) FrameSet containing colour and/or depth frames.
-
-        Raises:
-            RuntimeError: If no frames are returned within *timeout_ms*.
-            DeviceNotConnectedError: If the pipeline is not started.
-        """
+    def _read_from_hardware(self, timeout_ms: int = 200) -> "FrameSet | None":
+        """Read a FrameSet from the pipeline; apply software AlignFilter if set."""
         if self._pipeline is None:
             raise DeviceNotConnectedError(f"{self}: pipeline not started.")
 
-        frames: FrameSet = self._pipeline.wait_for_frames(timeout_ms)
+        frames = self._pipeline.wait_for_frames(timeout_ms)
         if frames is None:
-            raise RuntimeError(f"{self} _read_from_hardware(): no frames within {timeout_ms} ms.")
+            return None
 
-        # Depth-to-color alignment
         if self._align_filter is not None:
             frames = self._align_filter.process(frames)
             if frames is not None:
                 frames = frames.as_frame_set()
-            if frames is None:
-                raise RuntimeError(f"{self} _read_from_hardware(): align filter returned None.")
 
         return frames
 
     # ------------------------------------------------------------------
-    # Post-processing (mirrors RealSense _postprocess_image)
+    # Post-processing
     # ------------------------------------------------------------------
 
-    def _postprocess_image(
-        self,
-        image: NDArray[Any],
-        depth_frame: bool = False,
-    ) -> NDArray[Any]:
-        """Apply colour conversion, dimension validation and rotation.
+    def _postprocess_color(self, rgb: "NDArray[np.uint8]") -> "NDArray[np.uint8]":
+        """Validate, colour-convert, and rotate a color frame."""
+        h, w, c = rgb.shape
+        if c != 3:
+            raise RuntimeError(f"{self}: unexpected channel count {c}.")
 
-        For depth frames (``depth_frame=True``):
-        - Validates ``(H, W)`` matches ``capture_height × capture_width``.
-        - Applies rotation.
-        - Expands dims: ``(H, W)`` → ``(H, W, 1)`` (matches RealSense convention).
+        if (
+            self.capture_height
+            and self.capture_width
+            and (h != self.capture_height or w != self.capture_width)
+        ):
+            logger.debug(f"{self}: resize color {w}x{h} → {self.capture_width}x{self.capture_height}")
+            rgb = cv2.resize(rgb, (self.capture_width, self.capture_height))
 
-        For colour frames:
-        - Validates 3-channel input.
-        - Validates ``(H, W)`` matches ``capture_height × capture_width``.
-        - Applies colour-mode conversion (RGB → BGR if configured).
-        - Applies rotation.
-        """
-        if self.color_mode and self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
-            raise ValueError(f"Invalid color_mode '{self.color_mode}'.")
+        if self.color_mode == ColorMode.BGR:
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-        if depth_frame:
-            h, w = image.shape[:2]
+        if self.rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180):
+            rgb = cv2.rotate(rgb, self.rotation)
 
-            if (self.capture_height and self.capture_width
-                    and (h != self.capture_height or w != self.capture_width)):
-                raise RuntimeError(
-                    f"{self} depth frame width={w} or height={h} do not match "
-                    f"configured width={self.capture_width} or height={self.capture_height}."
-                )
+        return rgb
 
-            processed_image = image
-            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
-                processed_image = cv2.rotate(processed_image, self.rotation)
-
-            # (H, W) → (H, W, 1) — matches RealSense / dataset feature shape
-            processed_image = np.expand_dims(processed_image, axis=2)
-        else:
-            h, w, c = image.shape
-            if c != 3:
-                raise RuntimeError(f"{self}: unexpected channel count {c}.")
-
-            if (self.capture_height and self.capture_width
-                    and (h != self.capture_height or w != self.capture_width)):
-                raise RuntimeError(
-                    f"{self} frame width={w} or height={h} do not match "
-                    f"configured width={self.capture_width} or height={self.capture_height}."
-                )
-
-            processed_image = image
-            if self.color_mode == ColorMode.BGR:
-                processed_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
-                processed_image = cv2.rotate(processed_image, self.rotation)
-
-        return processed_image
+    def _postprocess_depth(self, depth_mm: "NDArray[np.uint16]") -> "NDArray[np.uint16]":
+        """Rotate and expand dims of a depth frame: (H, W) → (H, W, 1)."""
+        if self.rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180):
+            depth_mm = cv2.rotate(depth_mm, self.rotation)
+        return np.expand_dims(depth_mm, axis=2)
 
     # ------------------------------------------------------------------
-    # Background read thread (mirrors RealSense _read_loop)
+    # Background read thread
     # ------------------------------------------------------------------
 
     def _read_loop(self) -> None:
-        """Background loop: reads FrameSets from hardware, postprocesses, caches.
-
-        Key changes from the original Orbbec implementation:
-        1. Reads **one** FrameSet per iteration (colour + depth from the same frame).
-        2. Sets independent ``new_depth_frame_event``.
-        3. Failure counter — raises after 10 consecutive failures.
-        """
-        if self.stop_event is None:
-            raise RuntimeError(f"{self}: stop_event not initialised before _read_loop.")
-
-        failure_count = 0
-        while not self.stop_event.is_set():
+        """Continuously read FrameSets, process color + depth, cache results."""
+        assert self.stop_event is not None
+        stop = self.stop_event  # local reference avoids race when self.stop_event is cleared
+        while not stop.is_set():
             try:
-                # --- Read a single FrameSet containing both streams ---
-                frames = self._read_from_hardware(timeout_ms=10000)
+                frames = self._read_from_hardware(timeout_ms=200)
+                if frames is None:
+                    continue
 
-                # --- Process colour ---
                 color_frame_raw = frames.get_color_frame()
                 if color_frame_raw is None:
-                    raise RuntimeError(f"{self} _read_loop: FrameSet has no color frame.")
+                    continue
 
-                rgb_image = _frame_to_rgb_image(color_frame_raw)
-                if rgb_image is None:
-                    raise RuntimeError(
-                        f"{self} _read_loop: could not convert color frame "
-                        f"(format={color_frame_raw.get_format()}) to RGB."
+                rgb = _frame_to_rgb_image(color_frame_raw)
+                if rgb is None:
+                    logger.warning(
+                        f"{self}: could not convert color frame (fmt={color_frame_raw.get_format()})"
                     )
-                processed_color_frame = self._postprocess_image(rgb_image)
+                    continue
 
-                # --- Process depth (if enabled) ---
-                processed_depth_frame = None
+                processed_color = self._postprocess_color(rgb)
+                processed_depth = None
+
                 if self.use_depth:
                     depth_frame_raw = frames.get_depth_frame()
                     if depth_frame_raw is not None:
-                        width_d = depth_frame_raw.get_width()
-                        height_d = depth_frame_raw.get_height()
+                        w = depth_frame_raw.get_width()
+                        h = depth_frame_raw.get_height()
                         scale = depth_frame_raw.get_depth_scale()
+                        depth_data = np.frombuffer(depth_frame_raw.get_data(), dtype=np.uint16).reshape(
+                            (h, w)
+                        )
+                        if abs(scale - 1.0) < 1e-6:
+                            depth_mm = depth_data
+                        else:
+                            depth_mm = (depth_data.astype(np.float32) * scale).astype(np.uint16)
+                        processed_depth = self._postprocess_depth(depth_mm)
 
-                        depth_data = np.frombuffer(depth_frame_raw.get_data(), dtype=np.uint16)
-                        depth_data = depth_data.reshape((height_d, width_d))
-                        depth_mm = (depth_data.astype(np.float32) * scale).astype(np.uint16)
-
-                        processed_depth_frame = self._postprocess_image(depth_mm, depth_frame=True)
-
-                # --- Store results (thread-safe) ---
                 capture_time = time.perf_counter()
                 with self.frame_lock:
-                    self.latest_color_frame = processed_color_frame
-                    if self.use_depth and processed_depth_frame is not None:
-                        self.latest_depth_frame = processed_depth_frame
+                    self.latest_color_frame = processed_color
+                    if self.use_depth and processed_depth is not None:
+                        self.latest_depth_frame = processed_depth
                     self.latest_timestamp = capture_time
 
                 self.new_frame_event.set()
-                if self.use_depth and processed_depth_frame is not None:
+                if self.use_depth and processed_depth is not None:
                     self.new_depth_frame_event.set()
-
-                failure_count = 0
 
             except DeviceNotConnectedError:
                 break
             except Exception as e:
-                if failure_count <= 10:
-                    failure_count += 1
-                    logger.warning(f"{self} _read_loop error ({failure_count}/10): {e}")
-                else:
-                    raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
+                logger.warning(f"{self} _read_loop error: {e}")
 
     def _start_read_thread(self) -> None:
-        """Start (or restart) the background frame-read thread."""
         self._stop_read_thread()
-
         self.stop_event = Event()
         self.thread = Thread(target=self._read_loop, name=f"{self}_read_loop", daemon=True)
         self.thread.start()
 
     def _stop_read_thread(self) -> None:
-        """Signal the background thread to stop and wait for it to join."""
         if self.stop_event is not None:
             self.stop_event.set()
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=2.0)
+            if self.thread.is_alive():
+                logger.warning(f"{self}: read thread did not stop within 2 s.")
         self.thread = None
+        if self.stop_event is not None and not self.stop_event.is_set():
+            self.stop_event.set()
         self.stop_event = None
         with self.frame_lock:
             self.latest_color_frame = None
             self.latest_depth_frame = None
             self.latest_timestamp = None
             self.new_frame_event.clear()
-        self.new_depth_frame_event.clear()
+            self.new_depth_frame_event.clear()
 
     # ------------------------------------------------------------------
-    # Synchronous read (delegate to async — mirrors RealSense)
+    # Public read API
     # ------------------------------------------------------------------
 
-    def read(self, color_mode: ColorMode | None = None, timeout_ms: int = 0) -> NDArray[Any]:
-        """Capture a single **color** frame synchronously.
+    def read(self, timeout_ms: int = 0) -> "NDArray[Any]":
+        """Read a color frame synchronously (blocks until a new frame arrives).
 
-        Delegates to the background thread via ``async_read()``.
+        The output color ordering is determined by ``config.color_mode`` (RGB by default).
+        To change color ordering, configure it via ``OrbbecCameraConfig(color_mode=...)``.
 
-        Returns:
-            ``np.ndarray`` of shape ``(H, W, 3)`` with dtype ``uint8``.
+        Args:
+            timeout_ms: Maximum wait in milliseconds. Defaults to 10 000 ms.
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
-
+        wait_timeout_ms = timeout_ms if timeout_ms > 0 else 10000
         self.new_frame_event.clear()
-        frame = self.async_read(timeout_ms=10000)
-        return frame
+        return self.async_read(timeout_ms=wait_timeout_ms)
 
-    def read_depth(self, timeout_ms: int = 200) -> NDArray[Any]:
-        """Capture a single **depth** frame synchronously.
-
-        Delegates to the background thread: triggers ``async_read()`` to ensure
-        frames are updated, then reads ``latest_depth_frame`` from cache.
+    def read_depth(self, timeout_ms: int = 200) -> "NDArray[Any]":
+        """Read a depth frame synchronously.
 
         Returns:
-            ``np.ndarray`` of shape ``(H, W, 1)`` with dtype ``uint16`` (values in mm).
-
-        Raises:
-            RuntimeError: If depth is not enabled or no depth frame available.
+            ``np.ndarray`` of shape ``(H, W, 1)`` dtype ``uint16`` (values in mm).
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
         if not self.use_depth:
-            raise RuntimeError(
-                f"{self} read_depth(): depth stream is not enabled. "
-                f"Set use_depth=True in OrbbecCameraConfig."
-            )
-
+            raise RuntimeError(f"{self}: depth stream not enabled. Set use_depth=True.")
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
+        wait_timeout_ms = timeout_ms if timeout_ms > 0 else 10000
+        self.new_depth_frame_event.clear()
+        depth = self.async_read_depth(timeout_ms=wait_timeout_ms)
+        if depth is None:
+            raise RuntimeError(f"{self}: no depth frame available.")
+        return depth
 
-        # Trigger a frame update
-        self.new_frame_event.clear()
-        _ = self.async_read(timeout_ms=10000)
-
-        with self.frame_lock:
-            depth_map = self.latest_depth_frame
-
-        if depth_map is None:
-            raise RuntimeError(f"{self}: No depth frame available. Ensure camera is streaming.")
-
-        return depth_map
-
-    # ------------------------------------------------------------------
-    # Asynchronous read (mirrors RealSense)
-    # ------------------------------------------------------------------
-
-    def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
-        """Return the latest colour frame captured by the background thread.
+    def async_read(self, timeout_ms: float = 200) -> "NDArray[Any]":
+        """Return the latest color frame from the background thread.
 
         Args:
-            timeout_ms: Max wait (ms) for a frame to become available.
+            timeout_ms: Max wait in milliseconds for a new frame.
 
         Returns:
-            ``np.ndarray`` — the most recent colour frame ``(H, W, 3)``.
-
-        Raises:
-            DeviceNotConnectedError: If not connected.
-            TimeoutError: If no frame arrived within *timeout_ms*.
+            ``np.ndarray`` of shape ``(H, W, 3)`` dtype ``uint8``.
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
-
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
-            thread_alive = self.thread is not None and self.thread.is_alive()
-            raise TimeoutError(
-                f"Timed out waiting for frame from {self} after {timeout_ms} ms. "
-                f"Read thread alive: {thread_alive}."
-            )
-
+            raise TimeoutError(f"Timed out waiting for color frame from {self} after {timeout_ms} ms.")
         with self.frame_lock:
             frame = self.latest_color_frame
             self.new_frame_event.clear()
-
         if frame is None:
-            raise RuntimeError(f"{self}: async_read event fired but frame is None.")
-
+            raise RuntimeError(f"{self}: frame event fired but frame is None.")
         return frame
 
-    def async_read_depth(self, timeout_ms: float = 200) -> NDArray[Any] | None:
-        """Return the latest depth frame captured by the background thread.
+    def async_read_depth(self, timeout_ms: float = 200) -> "NDArray[Any] | None":
+        """Return the latest depth frame from the background thread.
 
-        Returns ``None`` if depth is not enabled (mirrors RealSense behaviour).
-
-        Args:
-            timeout_ms: Max wait (ms) for a depth frame.
+        Returns ``None`` if ``use_depth=False``.
 
         Returns:
-            ``np.ndarray`` of shape ``(H, W, 1)`` uint16, or ``None``.
+            ``np.ndarray`` of shape ``(H, W, 1)`` dtype ``uint16``, or ``None``.
         """
         if not self.use_depth:
             return None
-
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
-
         if not self.new_depth_frame_event.wait(timeout=timeout_ms / 1000.0):
-            thread_alive = self.thread is not None and self.thread.is_alive()
-            raise TimeoutError(
-                f"Timed out waiting for depth frame from {self} after {timeout_ms} ms. "
-                f"Read thread alive: {thread_alive}."
-            )
-
+            raise TimeoutError(f"Timed out waiting for depth frame from {self} after {timeout_ms} ms.")
         with self.frame_lock:
-            depth_frame = self.latest_depth_frame
+            depth = self.latest_depth_frame
             self.new_depth_frame_event.clear()
+        if depth is None:
+            raise RuntimeError(f"{self}: depth event fired but frame is None.")
+        return depth
 
-        if depth_frame is None:
-            raise RuntimeError(f"{self}: async_read_depth event fired but depth frame is None.")
-
-        return depth_frame
-
-    # ------------------------------------------------------------------
-    # Read latest (mirrors RealSense)
-    # ------------------------------------------------------------------
-
-    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
-        """Return the most recent (color) frame captured immediately (Peeking).
-
-        This method is non-blocking and returns whatever is currently in the
-        memory buffer. The frame may be stale.
-
-        Returns:
-            NDArray[Any]: The frame image (numpy array).
+    def read_latest(self, max_age_ms: int = 500) -> "NDArray[Any]":
+        """Return the most recent color frame without blocking (peek buffer).
 
         Raises:
-            TimeoutError: If the latest frame is older than `max_age_ms`.
-            DeviceNotConnectedError: If the camera is not connected.
-            RuntimeError: If the camera is connected but has not captured any frames yet.
+            TimeoutError: If the cached frame is older than ``max_age_ms``.
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
-
         with self.frame_lock:
             frame = self.latest_color_frame
             timestamp = self.latest_timestamp
-
         if frame is None or timestamp is None:
             raise RuntimeError(f"{self} has not captured any frames yet.")
-
         age_ms = (time.perf_counter() - timestamp) * 1e3
         if age_ms > max_age_ms:
-            raise TimeoutError(
-                f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
-            )
-
+            raise TimeoutError(f"{self} latest frame is {age_ms:.1f} ms old (max {max_age_ms} ms).")
         return frame
 
     # ------------------------------------------------------------------
@@ -910,19 +709,26 @@ class OrbbecCamera(Camera):
     def disconnect(self) -> None:
         """Stop the pipeline, background thread, and release all resources."""
         if not self.is_connected and self.thread is None:
-            raise DeviceNotConnectedError(
-                f"Attempted to disconnect {self}, but it is already disconnected."
-            )
+            raise DeviceNotConnectedError(f"Attempted to disconnect {self}, but it is already disconnected.")
 
         if self.thread is not None:
             self._stop_read_thread()
 
         if self._pipeline is not None:
-            try:
-                self._pipeline.stop()
-            except Exception as e:
-                logger.warning(f"{self} pipeline.stop() error: {e}")
-            self._pipeline = None
+            pipeline = self._pipeline
+            self._pipeline = None  # mark disconnected before blocking stop
+
+            def _stop_pipeline() -> None:
+                try:
+                    pipeline.stop()
+                except Exception as e:
+                    logger.warning(f"{self} pipeline.stop() error: {e}")
+
+            t = Thread(target=_stop_pipeline, daemon=True, name=f"{self}_pipeline_stop")
+            t.start()
+            t.join(timeout=3.0)
+            if t.is_alive():
+                logger.warning(f"{self}: pipeline.stop() did not finish within 3 s.")
 
         self._config = None
         self._align_filter = None
@@ -932,6 +738,6 @@ class OrbbecCamera(Camera):
             self.latest_depth_frame = None
             self.latest_timestamp = None
             self.new_frame_event.clear()
-        self.new_depth_frame_event.clear()
+            self.new_depth_frame_event.clear()
 
         logger.info(f"{self} disconnected.")
