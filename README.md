@@ -253,11 +253,12 @@ Key points:
 
 ### Train ACT with RGBD Input
 
-The ACT policy automatically detects depth features by looking for keys matching `<camera_key>_depth` in the dataset. When depth features are present, the ResNet backbone's first convolution layer is expanded to accept a 4-channel (RGB + D) input. Depth values are normalised to `[0, 1]` using `depth_max_range` (default: 10 m) before being concatenated with the RGB channels.
+The ACT policy automatically detects depth features by looking for keys matching `<camera_key>_depth` in the dataset. When depth features are present, the ResNet backbone's first convolution layer is expanded to accept a 4-channel (RGB + D) input. Depth values are normalised to `[0, 1]` by dividing by `depth_max_range` before being concatenated with the RGB channels. It is recommended to set `depth_max_range` to match the actual working distance of your task — for SO-101 tabletop grasping, 1 m is a good default (values beyond 1 m are clamped to 1.0).
 
 ```bash
 lerobot-train \
   --policy=act \
+  --policy.depth_max_range=1.0 \
   --dataset.repo_id=<your-rgbd-dataset>
 ```
 

@@ -101,7 +101,7 @@ class ACTConfig(PreTrainedConfig):
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
     # RGBD depth configuration.
-    depth_max_range: float = 10.0
+    depth_max_range: float = 1.0
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
