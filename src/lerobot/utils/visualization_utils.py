@@ -88,7 +88,7 @@ def init_rerun(
     session_name: str = "lerobot_control_loop",
     ip: str | None = None,
     port: int | None = None,
-    headless: bool = True,
+    headless: bool = False,
     grpc_port: int = 9876,
     web_port: int = 9090,
     open_browser: bool = False,
@@ -230,7 +230,7 @@ def _log_rerun_data_sync(
 ) -> None:
     """Synchronous implementation (runs in the background viz thread)."""
     # Get configuration from environment
-    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.33"))
+    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "1.0"))
     log_frequency = int(os.getenv("RERUN_LOG_FREQUENCY", "1"))
 
     # Frame counter for logging frequency

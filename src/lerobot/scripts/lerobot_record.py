@@ -150,7 +150,7 @@ from lerobot.utils.utils import (
     init_logging,
     log_say,
 )
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, start_viz_thread, stop_viz_thread
 
 
 @dataclass
@@ -517,6 +517,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
+        start_viz_thread()
     display_compressed_images = (
         True
         if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
@@ -701,6 +702,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     )
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+        if cfg.display_data:
+            stop_viz_thread()
 
         if dataset:
             dataset.finalize()
