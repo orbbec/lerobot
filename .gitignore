@@ -177,3 +177,7 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Orbbec SDK logs
+Log/
+*.log.txt

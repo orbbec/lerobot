@@ -92,7 +92,7 @@ def init_rerun(
     grpc_port: int = 9876,
     web_port: int = 9090,
     open_browser: bool = False,
-    server_memory_limit: str = "25%",
+    server_memory_limit: str = "500MB",
 ) -> None:
     """Initializes the Rerun SDK for visualizing the control loop.
 
@@ -152,6 +152,10 @@ def init_rerun(
         # Fallback to spawn a local viewer (for dev with GUI)
         memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
         rr.spawn(memory_limit=memory_limit)
+
+    # Clear stale entity paths from previous sessions so old camera labels
+    # (e.g. "head", "wrist" from a different robot config) don't bleed through.
+    rr.log("/", rr.Clear(recursive=True))
 
 
 def _is_scalar(x):
@@ -230,13 +234,18 @@ def _log_rerun_data_sync(
 ) -> None:
     """Synchronous implementation (runs in the background viz thread)."""
     # Get configuration from environment
-    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "1.0"))
+    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "1"))
     log_frequency = int(os.getenv("RERUN_LOG_FREQUENCY", "1"))
 
     # Frame counter for logging frequency
     if not hasattr(_log_rerun_data_sync, "_frame_counter"):
         _log_rerun_data_sync._frame_counter = 0
     _log_rerun_data_sync._frame_counter += 1
+
+    # Set time sequence so Rerun knows the temporal order of frames.
+    # This is critical: without it Rerun accumulates ALL frames in memory
+    # indefinitely instead of dropping old ones when the memory limit is hit.
+    rr.set_time_sequence("frame", _log_rerun_data_sync._frame_counter)
 
     # Skip this frame if logging frequency > 1
     if log_frequency > 1 and _log_rerun_data_sync._frame_counter % log_frequency != 0:
