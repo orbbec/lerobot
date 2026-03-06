@@ -125,6 +125,144 @@ lerobot-eval \
 
 Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
 
+## Orbbec RGBD Support
+
+This fork extends LeRobot with native support for **Orbbec depth cameras** and a **4-channel RGBD variant of the ACT policy**, validated on the SO-101 robotic arm.
+
+> Special thanks to [@ImpurestTadpole](https://github.com/ImpurestTadpole) for the open-source RGBD implementation.
+> Reference: [RGBD_IMPLEMENTATION_GUIDE.md](https://github.com/ImpurestTadpole/lerobot/blob/main/RGBD_IMPLEMENTATION_GUIDE.md)
+
+### What's Added
+
+| Component            | Description                                                                                                    |
+| -------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `OrbbecCamera`       | Camera driver for Orbbec depth cameras via `pyorbbecsdk2`, supporting synchronized color + depth capture       |
+| `OrbbecCameraConfig` | Configuration with `use_depth`, `align_depth`, `d2c_mode` (hardware/software D2C alignment)                    |
+| RGBD ACT             | ACT policy extended to accept 4-channel (RGB + Depth) input; ResNet `conv1` is modified from 3-ch to 4-ch      |
+| SO-101 + Orbbec      | End-to-end validation of data collection, training, and inference on the SO-101 arm with an Orbbec RGBD camera |
+
+### Installation
+
+Install the Orbbec SDK Python bindings in addition to the standard LeRobot dependencies:
+
+```bash
+pip install pyorbbecsdk2==2.0.18
+```
+
+> [!WARNING]
+> **Linux — first-time setup:** Before using an Orbbec camera for the first time, install the udev rules so the device is accessible. Run once after installing the package:
+>
+> ```bash
+> SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+> sudo chmod +x "$SITE_PACKAGES/pyorbbecsdk/shared/install_udev_rules.sh"
+> sudo "$SITE_PACKAGES/pyorbbecsdk/shared/install_udev_rules.sh"
+> sudo udevadm control --reload-rules && sudo udevadm trigger
+> ```
+>
+> For more details, see the [pyorbbecsdk installation guide](https://orbbec.github.io/pyorbbecsdk/source/2_installation/install_the_package.html#verify-the-installation).
+
+### Discover Connected Orbbec Cameras
+
+Run the following command to list all connected Orbbec devices:
+
+```bash
+lerobot-find-cameras orbbec
+```
+
+Example output:
+
+```
+--- Detected Cameras ---
+Camera #0:
+  Type: Orbbec
+  Index: 0
+  Name: Orbbec Gemini 336L
+  Id: CPCG85300038
+  Connection type: USB3.2
+  Has color sensor: True
+  Has depth sensor: True
+  Default color profile: {'width': 1280, 'height': 720, 'fps': 30, 'format': 'OBFormat.MJPG'}
+  Default depth profile: {'width': 848, 'height': 480, 'fps': 30, 'format': 'OBFormat.Y16'}
+--------------------
+Camera #1:
+  Type: Orbbec
+  Index: 1
+  Name: Orbbec Gemini 336
+  Id: CP99853000V8
+  Connection type: USB3.2
+  Has color sensor: True
+  Has depth sensor: True
+  Default color profile: {'width': 1280, 'height': 720, 'fps': 30, 'format': 'OBFormat.MJPG'}
+  Default depth profile: {'width': 848, 'height': 480, 'fps': 30, 'format': 'OBFormat.Y16'}
+--------------------
+```
+
+The `Id` field (serial number) is what you pass as `index_or_serial_number` in the camera config. Using the serial number rather than `Index` is recommended — the index may change after a reboot or USB replug, while the serial number is stable.
+
+### Collect a Dataset
+
+Use `lerobot-record` to teleoperate the SO-101 and record an RGBD dataset. The example below mounts three cameras: one OpenCV wrist camera and two Orbbec cameras (one colour-only, one with software-aligned depth):
+
+```bash
+lerobot-record \
+  --robot.type=so101_follower \
+  --robot.port=/dev/so101_follower \
+  --robot.id=so101_follower \
+  --robot.cameras='{
+    "wrist": {
+      "type": "opencv",
+      "index_or_path": 0,
+      "width": 640,
+      "height": 480,
+      "fps": 30
+    },
+    "left": {
+      "type": "orbbec",
+      "index_or_serial_number": "CPCG85300038",
+      "width": 640,
+      "height": 480,
+      "fps": 30
+    },
+    "head": {
+      "type": "orbbec",
+      "index_or_serial_number": "CP99853000V8",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "use_depth": true,
+      "align_depth": true,
+      "d2c_mode": "software"
+    }
+  }' \
+  --teleop.type=so101_leader \
+  --teleop.port=/dev/so101_leader \
+  --teleop.id=so101_leader \
+  --dataset.repo_id=<your-rgbd-dataset> \
+  --dataset.single_task="pick up the cube and place it in the box" \
+  --dataset.num_episodes=50 \
+  --dataset.fps=30 \
+  --display_data=true
+```
+
+Key points:
+
+- `wrist` — standard USB webcam via `OpenCVCamera`
+- `left` — Orbbec Gemini 336L (`Id: CPCG85300038`), colour only (no depth)
+- `head` — Orbbec Gemini 336 (`Id: CP99853000V8`), depth enabled with software D2C alignment
+- Depth frames are stored under the key `observation.images.head_depth` in the dataset
+
+### Train ACT with RGBD Input
+
+The ACT policy automatically detects depth features by looking for keys matching `<camera_key>_depth` in the dataset. When depth features are present, the ResNet backbone's first convolution layer is expanded to accept a 4-channel (RGB + D) input. Depth values are normalised to `[0, 1]` using `depth_max_range` (default: 10 m) before being concatenated with the RGB channels.
+
+```bash
+lerobot-train \
+  --policy=act \
+  --dataset.repo_id=<your-rgbd-dataset>
+```
+
+For a full step-by-step guide covering data collection, dataset creation, training, and deployment, see the [RGBD Implementation Guide](https://github.com/ImpurestTadpole/lerobot/blob/main/RGBD_IMPLEMENTATION_GUIDE.md).
+
 ## Resources
 
 - **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
