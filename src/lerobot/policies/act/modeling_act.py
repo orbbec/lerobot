@@ -512,9 +512,8 @@ class ACT(nn.Module):
                     if img_key in self._depth_map:
                         depth = batch[self._depth_map[img_key]]
                         depth = (depth / self.config.depth_max_range).clamp(0, 1)
-                        rgb_shape = list(img.shape)
                         img = torch.cat([img, depth], dim=1)  # (B, 4, H, W)
-                        print(f"[ACT] camera '{img_key}': RGB{rgb_shape} + depth -> 4ch {list(img.shape)}")
+                        # print(f"[ACT] camera '{img_key}': RGB[...] + depth -> 4ch {list(img.shape)}")
                     else:
                         # Zero-pad cameras without depth to match 4-channel backbone
                         pad = torch.zeros(
@@ -525,11 +524,8 @@ class ACT(nn.Module):
                             dtype=img.dtype,
                             device=img.device,
                         )
-                        rgb_shape = list(img.shape)
                         img = torch.cat([img, pad], dim=1)  # (B, 4, H, W)
-                        print(
-                            f"[ACT] camera '{img_key}': RGB{rgb_shape} zero-padded to 4ch {list(img.shape)}"
-                        )
+                        # print(f"[ACT] camera '{img_key}': RGB[...] zero-padded to 4ch {list(img.shape)}")
 
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
