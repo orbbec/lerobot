@@ -146,7 +146,7 @@ This fork extends LeRobot with native support for **Orbbec depth cameras** and a
 Install the Orbbec SDK Python bindings in addition to the standard LeRobot dependencies:
 
 ```bash
-pip install pyorbbecsdk2==2.0.18
+pip install "pyorbbecsdk2>=2.0.18"
 ```
 
 > [!WARNING]
