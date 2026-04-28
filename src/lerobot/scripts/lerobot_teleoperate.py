@@ -58,12 +58,8 @@ import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
-import rerun as rr
-
-from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
-from lerobot.cameras.orbbec.configuration_orbbec import OrbbecCameraConfig  # noqa: F401
-from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.orbbec import OrbbecCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
